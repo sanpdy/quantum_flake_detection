@@ -216,7 +216,7 @@ class QuantumMLDetection(torchvision.datasets.CocoDetection):
             img, target = self._transforms(img, target)
         return img, target
 
-
+"""
 def get_quantumml(root, image_set, transforms, mode="instances"):
     t = [ConvertCocoPolysToMask()]
 
@@ -224,18 +224,37 @@ def get_quantumml(root, image_set, transforms, mode="instances"):
         t.append(transforms)
     transforms = T.Compose(t)
 
-    # img_folder, ann_file = PATHS[image_set]
-    img_folder = os.path.join(root, image_set, 'images')
-    ann_file = os.path.join(root, image_set, 'annotations', 'instances_default_clean.json')
+    if image_set == "merged":
+        # Use the merged annotation file.
+        # Here we assume that your merged annotations already have full absolute paths for the images.
+        img_folder = ""  # Not needed because file_name already holds the full path.
+        ann_file = os.path.join(root, 'annotations', 'instances_default_clean.json')
+    else:
+        img_folder = os.path.join(root, image_set, 'images')
+        ann_file = os.path.join(root, image_set, 'annotations', 'instances_default_clean.json')
 
     dataset = QuantumMLDetection(img_folder, ann_file, transforms=transforms)
 
-    # if image_set == "train":
+    # Remove images without annotations.
     dataset = _coco_remove_images_without_annotations(dataset)
 
-    # dataset = torch.utils.data.Subset(dataset, [i for i in range(500)])
-
     return dataset
+"""
 
+def get_quantumml(root, image_set, transforms, mode="instances"):
+    t = [ConvertCocoPolysToMask()]
+    if transforms is not None:
+        t.append(transforms)
+    transforms = T.Compose(t)
+    img_folder = os.path.join(root, image_set)
+    
+    ann_filename = f"instances_{image_set}_clean.json"
+    ann_file = os.path.join(root, "annotations", ann_filename)
+    print("ANN: ", ann_file)
+    print("IMG_FOLDER: ", img_folder)
+
+    dataset = QuantumMLDetection(img_folder, ann_file, transforms=transforms)
+    dataset = _coco_remove_images_without_annotations(dataset)
+    return dataset
 
 

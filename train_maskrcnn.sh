@@ -2,9 +2,11 @@ set -e
 set -x
 
 torchrun --nproc_per_node=1 train.py \
-    --data-path data/quantumml/ \
+    --data-path /home/sankalp/quant_flakes/quantumml/DL_2DMaterials/BN/ \
     --model maskrcnn_resnet50_fpn \
     --lr 0.0002 \
-    --epochs 1000 \
+    --epochs 300 \
     --lr-scheduler cosineannealinglr \
-    --output-dir ./logs/maskrcnn_resnet50_fpn_data_v1
+    --output-dir ./neurips_logs/ \
+    --data-augmentation contrastive \
+    --pretrained-backbone  

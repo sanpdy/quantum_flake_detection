@@ -45,21 +45,49 @@ def get_dataset(name, image_set, transform, data_path):
     # p, ds_fn, num_classes = paths[name]
 
     ds = get_quantumml(data_path, image_set=image_set, transforms=transform)
-    num_classes = 5
+    num_classes = 4
     return ds, num_classes
+
+import torchvision.transforms as T
+from torchvision.transforms import functional as F
+import random
+
+class DetectionPresetTrainContrastive:
+    def __init__(self, image_size=800):
+        self.image_size = image_size
+        self.color_jitter = T.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
+        self.random_grayscale = T.RandomGrayscale(p=0.2)
+        self.zoom = T.RandomAffine(degrees=0, scale=(0.8, 1.2))
+        self.to_tensor = T.ToTensor()
+
+    def __call__(self, image, target):
+        # Contrastive augmentation.
+        image = self.color_jitter(image)
+        # Random grayscale.
+        image = self.random_grayscale(image)
+        # Zoom in/out.
+        image = self.zoom(image)
+        
+        image = self.to_tensor(image)
+        return image, target
 
 
 def get_transform(train, args):
     if train:
-        return presets.DetectionPresetTrain(args.data_augmentation)
-    elif not args.prototype:
-        return presets.DetectionPresetEval()
-    else:
-        if args.weights:
-            weights = prototype.models.get_weight(args.weights)
-            return weights.transforms()
+        if args.data_augmentation == "contrastive":
+            # You can pass additional parameters (like image_size) if needed.
+            return DetectionPresetTrainContrastive(image_size=800)
         else:
-            return prototype.transforms.CocoEval()
+            return presets.DetectionPresetTrain(args.data_augmentation)
+    else:
+        if not args.prototype:
+            return presets.DetectionPresetEval()
+        else:
+            if args.weights:
+                weights = prototype.models.get_weight(args.weights)
+                return weights.transforms()
+            else:
+                return prototype.transforms.CocoEval()
 
 
 def get_args_parser(add_help=True):
@@ -141,6 +169,13 @@ def get_args_parser(add_help=True):
         action="store_true",
     )
 
+    parser.add_argument(
+        "--pretrained-backbone",
+        dest="pretrained_backbone",
+        help="Use pre-trained backbone only",
+        action="store_true",
+    )
+
     # distributed training parameters
     parser.add_argument("--world-size", default=1, type=int, help="number of distributed processes")
     parser.add_argument("--dist-url", default="env://", type=str, help="url used to set up distributed training")
@@ -172,34 +207,39 @@ def main(args):
     print(args)
 
     device = torch.device(args.device)
+    train_dataset, num_classes = get_dataset(args.dataset, "train2019", get_transform(True, args), args.data_path)
+    val_dataset, _ = get_dataset(args.dataset, "val2019", get_transform(False, args), args.data_path)
 
-    # Data loading code
-    print("Loading data")
-
-    dataset, num_classes = get_dataset(args.dataset, "quantumml_v1", get_transform(True, args), args.data_path)
-    dataset_test, _ = get_dataset(args.dataset, "quantumml_v1", get_transform(False, args), args.data_path)
 
     print("Creating data loaders")
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+        test_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
     else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+        train_sampler = torch.utils.data.RandomSampler(train_dataset)
+        test_sampler = torch.utils.data.SequentialSampler(val_dataset)
 
     if args.aspect_ratio_group_factor >= 0:
-        group_ids = create_aspect_ratio_groups(dataset, k=args.aspect_ratio_group_factor)
+        group_ids = create_aspect_ratio_groups(train_dataset, k=args.aspect_ratio_group_factor)
         train_batch_sampler = GroupedBatchSampler(train_sampler, group_ids, args.batch_size)
     else:
         train_batch_sampler = torch.utils.data.BatchSampler(train_sampler, args.batch_size, drop_last=True)
 
     data_loader = torch.utils.data.DataLoader(
-        dataset, batch_sampler=train_batch_sampler, num_workers=args.workers, collate_fn=utils.collate_fn
+        train_dataset, batch_sampler=train_batch_sampler, num_workers=args.workers, collate_fn=utils.collate_fn
     )
 
     data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=1, sampler=test_sampler, num_workers=args.workers, collate_fn=utils.collate_fn
+        val_dataset, batch_size=1, sampler=test_sampler, num_workers=args.workers, collate_fn=utils.collate_fn
     )
+
+    def get_model(num_classes, pretrained_backbone=True):
+        model = torchvision.models.detection.maskrcnn_resnet50_fpn(
+            pretrained=False,
+            num_classes=num_classes,
+            pretrained_backbone=pretrained_backbone  # Load pretrained backbone only
+        )
+        return model
 
     print("Creating model")
     kwargs = {"trainable_backbone_layers": args.trainable_backbone_layers}
@@ -208,8 +248,11 @@ def main(args):
             kwargs["rpn_score_thresh"] = args.rpn_score_thresh
     if not args.prototype:
         model = torchvision.models.detection.__dict__[args.model](
-            pretrained=args.pretrained, num_classes=num_classes, **kwargs
-        )
+            pretrained=False,
+            pretrained_backbone=args.pretrained_backbone,
+            num_classes=num_classes,
+            **kwargs
+    )
     else:
         model = prototype.models.detection.__dict__[args.model](weights=args.weights, num_classes=num_classes, **kwargs)
     model.to(device)
@@ -222,7 +265,6 @@ def main(args):
         model_without_ddp = model.module
 
     params = [p for p in model.parameters() if p.requires_grad]
-    # optimizer = torch.optim.SGD(params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
     scaler = torch.cuda.amp.GradScaler() if args.amp else None
@@ -267,17 +309,16 @@ def main(args):
             }
             if args.amp:
                 checkpoint["scaler"] = scaler.state_dict()
-            # utils.save_on_master(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-            utils.save_on_master(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
+            utils.save_on_master(checkpoint, os.path.join(args.output_dir, "BN_segment.pth"))
 
-        # evaluate after every epoch
-        # evaluate(model, data_loader_test, device=device)
+        # Optionally, evaluate on the validation set after every epoch
+        evaluate(model, data_loader_test, device=device)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print(f"Training time {total_time_str}")
 
-
 if __name__ == "__main__":
     args = get_args_parser().parse_args()
     main(args)
+
